@@ -1,0 +1,22 @@
+name: pharmacyone-whmcs-sync
+
+networks:
+  pharmacyone_net:
+    external: true
+
+services:
+  whmcs-goodday-sync:
+    build:
+      context: .
+    container_name: whmcs-goodday-sync
+    restart: unless-stopped
+    networks:
+      - pharmacyone_net
+    env_file:
+      - ./whmcs-goodday-sync/.env
+    environment:
+      STATE_FILE: /app/runtime/state.json
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./whmcs-goodday-sync/state.json:/app/runtime/state.json

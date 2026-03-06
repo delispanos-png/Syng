@@ -1,0 +1,23 @@
+# Git
+.git
+.gitignore
+
+# Python cache / virtualenv
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*/venv/
+
+# Local runtime state
+whmcs-goodday-sync/state.json
+whmcs-goodday-sync/state.json.lock
+state.json/
+
+# Local env / editor
+.env
+whmcs-goodday-sync/.env
+*.swp
+*.swo
+.DS_Store

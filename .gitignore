@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+whmcs-goodday-sync/.env
+whmcs-goodday-sync/state.json
+whmcs-goodday-sync/state.json.lock
