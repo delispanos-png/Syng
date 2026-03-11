@@ -752,13 +752,16 @@ def whmcs_get_client_phone(client_id: str) -> str:
         return CLIENT_PHONE_CACHE[cid]
     try:
         data = whmcs_api("GetClientsDetails", clientid=int(cid), stats=False)
-        phone = str(data.get("phonenumber") or "").strip()
+        # Prefer formatted phone from WHMCS when available because it usually
+        # contains the international country prefix of the client.
+        phone = str(data.get("phonenumberformatted") or data.get("phonenumber") or "").strip()
         phone = normalize_phone_with_country_prefix(phone)
         CLIENT_PHONE_CACHE[cid] = phone
         return phone
     except Exception as e:
         log("ERROR", f"Failed to fetch client phone for client_id={cid}: {repr(e)}")
-        CLIENT_PHONE_CACHE[cid] = ""
+        # Do not cache failures as empty values; retry on next cycle.
+        CLIENT_PHONE_CACHE.pop(cid, None)
         return ""
 
 
@@ -767,8 +770,12 @@ def normalize_phone_with_country_prefix(phone: str) -> str:
     if not raw:
         return ""
 
-    # keep leading plus only, remove spaces/separators
-    cleaned = raw.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    # Keep only digits and plus, then normalize plus position.
+    cleaned = re.sub(r"[^\d+]", "", raw)
+    if cleaned.startswith("+"):
+        cleaned = "+" + re.sub(r"\D", "", cleaned[1:])
+    else:
+        cleaned = re.sub(r"\D", "", cleaned)
 
     # already international format
     if cleaned.startswith("+"):
@@ -1325,7 +1332,9 @@ def sync_ticket_status_to_goodday(ticket: dict, entry: dict):
     """
     if not env_bool("SYNC_STATUS_TO_GOODDAY", "1"):
         return
-    if not env_str("GOODDAY_CF_WHMCS_STATUS_ID"):
+    has_status_cf = bool(env_str("GOODDAY_CF_WHMCS_STATUS_ID"))
+    has_phone_cf = bool(env_str("GOODDAY_CF_REQUESTOR_PHONE_ID"))
+    if not has_status_cf and not has_phone_cf:
         return
 
     task_id = str(entry.get("task_id") or "").strip()
@@ -1333,12 +1342,16 @@ def sync_ticket_status_to_goodday(ticket: dict, entry: dict):
         return
 
     status_now = str(ticket.get("status") or "").strip()
-    status_last = str(entry.get("last_status_synced") or "").strip()
-    if status_now == status_last:
+    user_id = ticket.get("userid")
+    requestor_phone_now = whmcs_get_client_phone(user_id) if user_id is not None else ""
+    sync_marker_now = f"{status_now}|{requestor_phone_now}"
+    sync_marker_last = str(entry.get("last_custom_fields_sync_marker") or "").strip()
+    if sync_marker_now == sync_marker_last:
         return
 
     gd_update_task_custom_fields(ticket, task_id)
     entry["last_status_synced"] = status_now
+    entry["last_custom_fields_sync_marker"] = sync_marker_now
     tid = str(ticket.get("ticketid") or ticket.get("id") or "").strip()
     log("INFO", f"Synced ticket status to GoodDay for ticket {tid}: {status_now!r}")
 
@@ -1865,6 +1878,7 @@ def load_state():
                     "gd_mirror_message_signatures": {},
                     "gd_to_whmcs_backoff_until": 0.0,
                     "last_status_synced": "",
+                    "last_custom_fields_sync_marker": "",
                     "last_gd_status_synced": "",
                     "last_whmcs_status_set_from_gd": "",
                 }
@@ -1899,6 +1913,8 @@ def load_state():
                 entry["gd_to_whmcs_backoff_until"] = 0.0
             if "last_status_synced" not in entry:
                 entry["last_status_synced"] = ""
+            if "last_custom_fields_sync_marker" not in entry:
+                entry["last_custom_fields_sync_marker"] = ""
             if "last_gd_status_synced" not in entry:
                 entry["last_gd_status_synced"] = ""
             if "last_whmcs_status_set_from_gd" not in entry:
@@ -3531,6 +3547,7 @@ def main():
                     "gd_mirror_message_signatures": {},
                     "gd_to_whmcs_backoff_until": 0.0,
                     "last_status_synced": "",
+                    "last_custom_fields_sync_marker": "",
                     "last_gd_status_synced": "",
                     "last_whmcs_status_set_from_gd": "",
                 })
@@ -3581,7 +3598,11 @@ def main():
                     if task_id and task_id != "DRY_RUN_TASK_ID":
                         try:
                             gd_update_task_custom_fields(t, task_id)
-                            entry["last_status_synced"] = str(t.get("status") or "").strip()
+                            status_now = str(t.get("status") or "").strip()
+                            user_id_now = t.get("userid")
+                            requestor_phone_now = whmcs_get_client_phone(user_id_now) if user_id_now is not None else ""
+                            entry["last_status_synced"] = status_now
+                            entry["last_custom_fields_sync_marker"] = f"{status_now}|{requestor_phone_now}"
                         except Exception as e:
                             log("ERROR", f"Custom fields update failed for ticket {tid} task {task_id}: {repr(e)}")
 
@@ -3668,6 +3689,15 @@ def main():
                             sync_goodday_status_to_whmcs(tid, entry, task_obj, gd_status_map)
                         except Exception as e:
                             log("ERROR", f"GoodDay status -> WHMCS sync failed for ticket {tid}: {repr(e)}")
+
+                # STATUS/CUSTOM FIELDS -> GOODDAY
+                # Keep this before reply sync, so transient GetTicket(reply) failures
+                # do not block requestor phone/status updates.
+                if (not skip_whmcs_to_goodday) and entry.get("task_id") and entry.get("task_id") != "DRY_RUN_TASK_ID":
+                    try:
+                        sync_ticket_status_to_goodday(t, entry)
+                    except Exception as e:
+                        log("ERROR", f"Status sync failed for ticket {tid}: {repr(e)}")
 
                 # REPLIES AS COMMENTS
                 if (not skip_whmcs_to_goodday) and sync_replies and entry.get("task_id") and entry.get("task_id") != "DRY_RUN_TASK_ID":
@@ -4044,13 +4074,6 @@ def main():
                     entry["gd_public_to_whmcs_reply_ids"] = gd_public_to_whmcs_reply_ids
                     entry["gd_pending_public_reply_signatures"] = gd_pending_public_reply_signatures
                     entry["gd_public_message_signatures"] = gd_public_signatures
-
-                # STATUS -> GOODDAY
-                if (not skip_whmcs_to_goodday) and entry.get("task_id") and entry.get("task_id") != "DRY_RUN_TASK_ID":
-                    try:
-                        sync_ticket_status_to_goodday(t, entry)
-                    except Exception as e:
-                        log("ERROR", f"Status sync failed for ticket {tid}: {repr(e)}")
 
                 # GOODDAY -> WHMCS (explicit public messages only)
                 if (
